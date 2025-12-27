@@ -1,0 +1,1 @@
+FiberGPT implementation in [Soket](https://github.com/singul4ri7y/soket). Coming soon!
