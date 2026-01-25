@@ -1,8 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Use NVIDIA transformer_engine to train in FP8 if for B200 GPUs.
 
 
 @dataclass
@@ -11,13 +14,23 @@ class FiberGPTConfig:
     # for efficiency.
     n_vocab: int = 50304
     context_length: int = 2048
-    n_layer: int = 16
-    n_head: int = 16
-    n_embd: int = 768
+    n_layer: int = 32
+    n_head: int = 8
+    n_embd: int = 1024
+    freq_base: int = 10000
     n_hidden: int = n_embd
     ffwd_dim_multiplier: int = 4
     norm_eps: float = 1e-5
     drop_prob: float = 0.0
+
+
+def rms_norm(x: torch.Tensor, eps: float):
+    '''
+    RMS Normalization without parameters. Generally, RMSNorm parameter seldom
+    gets trained.
+    '''
+
+    return F.rms_norm(x, (x.shape[-1],), None, eps)
 
 
 def _apply_rope(q: torch.Tensor, k: torch.Tensor, rope_cache: torch.Tensor):
@@ -30,7 +43,7 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, rope_cache: torch.Tensor):
     # Get complex domain representation of 2D block vectors
     # (B, T, nh, hs // 2)
     q = torch.view_as_complex(q.float().view(*q.shape[:-1], -1, 2))
-    k = torch.view_as_complex(k.float().view(*q.shape[:-1], -1, 2))
+    k = torch.view_as_complex(k.float().view(*k.shape[:-1], -1, 2))
 
     # Make RoPE cache broadcastable.
     rope_cache = rope_cache.unsqueeze(1)
@@ -52,7 +65,7 @@ class CausalAttention(nn.Module):
         # embedding dimension (or d_model). So, embedding dimension should be
         # perfectly divisible by the number of heads.
         assert config.n_embd % config.n_head == 0
-        self.n_embd = config.n_embd
+        self.eps = config.norm_eps
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
         
@@ -70,7 +83,7 @@ class CausalAttention(nn.Module):
 
         qkv = self.attn_qkv(x)
         # Extract query, key and value from fused linear transformation
-        q, k, v = qkv.split(self.n_embd, dim=-1)  # (B, T, C), where C = n_embd
+        q, k, v = qkv.chunk(3, dim=-1)  # (B, T, C), where C = n_embd
         
         # Consider each head is concatenated in column axis. So, we might end up
         # with something like this:
@@ -109,6 +122,7 @@ class CausalAttention(nn.Module):
 
         # Apply RoPE before transposition.
         q, k = _apply_rope(q, k, rope_cache)
+        q, k = rms_norm(q, self.eps), rms_norm(k, self.eps)
         q, k = q.transpose(1, 2), k.transpose(1, 2)
 
         # Apply attention
@@ -146,14 +160,13 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: FiberGPTConfig):
         super().__init__()
     
+        self.eps = config.norm_eps
         self.attn = CausalAttention(config)
-        self.attn_norm = nn.RMSNorm(config.n_embd, eps=config.norm_eps)
         self.ffwd = FeedForward(config)
-        self.ffwd_norm = nn.RMSNorm(config.n_embd, eps=config.norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor):
-        h = x + self.attn(self.attn_norm(x), rope_cache)
-        return h + self.ffwd(self.ffwd_norm(h))
+        h = x + self.attn(rms_norm(x, self.eps), rope_cache)
+        return h + self.ffwd(rms_norm(h, self.eps))
 
 
 class FiberGPT(nn.Module):
@@ -164,12 +177,16 @@ class FiberGPT(nn.Module):
 
         self.token_embedding = nn.Embedding(config.n_vocab, config.n_embd)
 
+        # eps for `rms_norm`
+        self.eps = config.norm_eps
+
         # Compute rope cache
         self.context_length = config.context_length
         self.register_buffer('rope_cache', self._compute_rope_cache(
             config.n_embd // config.n_head,
-            config.context_length
-        ))
+            config.context_length,
+            base = config.freq_base
+        ), persistent=False)
 
         # Decoder blocks
         self.dec_blocks = nn.ModuleList(
@@ -177,16 +194,17 @@ class FiberGPT(nn.Module):
         )
 
         # Projection
-        self.norm = nn.RMSNorm(config.n_embd, eps=config.norm_eps)
         self.proj = nn.Linear(config.n_embd, config.n_vocab, bias=False)
 
     def _compute_rope_cache(
         self,
         head_size: int,
         context_length: int,
-        base: int = 100000,
+        base: int = 10000,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
+        ## TODO: Keep RoPE cache in bfloat16
+
         ''' Precompute rotation cache of Rotary Positional Embedding. '''
 
         if device is None:
@@ -242,6 +260,18 @@ class FiberGPT(nn.Module):
 
         return torch.polar(torch.ones_like(m_theta), m_theta)  # complex64
     
+    def _device(self):
+        return self.token_embedding.weight.device
+
+    def total_params(self):
+        ''' Return the total number of parameters. '''
+
+        params = 0
+        for p in self.parameters():
+            params += p.numel()
+
+        return params
+    
     def forward(
         self,
         tokens: torch.Tensor,
@@ -263,14 +293,64 @@ class FiberGPT(nn.Module):
             x = blk(x, rope_cache)
 
         # projection
-        logits = self.proj(self.norm(x))
+        logits = self.proj(rms_norm(x, self.eps))
 
         if targets is not None:
             return F.cross_entropy(
-                logits.flatten(1),
-                targets.flatten(0),
+                logits.view(B * T, -1),
+                targets.view(B * T).long(),
                 reduction=loss_reduction
             )
         else:
             return logits
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        tokens: List,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = None,
+        seed: int = 42
+    ):
+        ''' Autoregressive streaming interface. '''
+
+        assert isinstance(tokens, list), 'Given tokens must be a list!'
+
+        device = self._device()
+
+        rng = None
+        if temperature > 0.0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+
+        # Token indicies (with batch dimension)
+        idx = torch.tensor([tokens], dtype=torch.long, device=device)
+
+        for _ in range(max_tokens):
+            # Cap tokens upto context length
+            idx = idx[:, -self.context_length:]
+            logits = self.forward(idx)  # (B, T, n_vocab)
+
+            # We are interested in the very last word
+            logits = logits[:, -1, :]
+
+            # Apply Top-K
+            if top_k is not None:
+                values, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
+                # Zero out the probabilties not top-N during softmax.
+                logits[logits < v[:, [-1]]] = float('-inf')
+            
+            # Apply temperature
+            if temperature > 0:
+                logits /= temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # append
+            idx = torch.concat([idx, next_token], dim=1)
+
+            yield next_token.item()
 
