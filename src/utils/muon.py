@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import torch
 from torch.optim import Optimizer
 from typing import List
 
@@ -25,12 +26,9 @@ polar_express_coeffs = [
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-@torch.no_grad()
 def _polar_express(G: torch.Tensor, steps: int = 5):
     '''
     Polar Express method for matrix orthogonalization.
-
-    Source: https://arxiv.org/pdf/2505.16932 (Noah Amsen et al.)
     '''
 
     assert G.ndim >= 2
@@ -64,7 +62,13 @@ def _polar_express(G: torch.Tensor, steps: int = 5):
 
 
 class Muon(Optimizer):
-    ''' The Muon Optimizer (single device). '''
+    '''
+    Muon - MomentUm Orthogonalized by Newton-schulz (single device)
+    https://arxiv.org/abs/2502.16982
+
+    Polar express is used for orthogonalization instead of Newton-schulz:
+    https://arxiv.org/abs/2505.16932 (Noah Amsen et al. 2025)
+    '''
 
     def __init__(
         self,
@@ -85,12 +89,7 @@ class Muon(Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
+    def step(self):
         for group in self.param_groups:
             params = group['params']
 
@@ -103,19 +102,16 @@ class Muon(Optimizer):
             for p in params:
                 # parameter gradient
                 g = p.grad
-                if g is None:
-                    continue
+                assert g is not None
 
                 state = self.state[p]
-                if 'momentum_buf' not in state:
-                    state['momentum_buf'] = torch.zeros_like(g)
-                buf = state['momentum_buf']
+                if 'momentum_buff' not in state:
+                    state['momentum_buff'] = torch.zeros_like(g)
+                buff = state['momentum_buff']
 
                 # buf = momentum * buf + (1 - momentum) * g
-                buf.lerp_(g, 1 - momentum)
-
-                # Nesterov momentum
-                g = g.lerp_(buf, momentum) if nesterov else buf
+                buff.lerp_(g, 1 - momentum)
+                g = g.lerp_(buff, momentum) if nesterov else buff
 
                 # Orthogonalize
                 g = _polar_express(g, steps=ortho_steps)
@@ -127,8 +123,6 @@ class Muon(Optimizer):
 
                 # Update
                 p.sub_(g.view_as(p), alpha=lr)
-
-        return loss
 
 
 class DistributedMuon(Optimizer):
@@ -150,24 +144,25 @@ class DistributedMuon(Optimizer):
             nesterov=nesterov,
             ortho_steps=ortho_steps
         )
+
         super().__init__(params, defaults)
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        # Store distributed info
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
 
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+    @torch.no_grad()
+    def step(self):
+        # Stores futures of individual processes parameter update and gathering
+        # for each world_size chunks for each parameter groups.
+        futures = []
 
         for group in self.param_groups:
             params = group['params']
             nparams = len(params)  # non padded length
             # Make parameter count divisible by world size.
-            params = params + [ torch.zeros_like(params[-1]) ] * (world_size -
-                nparams % world_size)
+            params = params + [ torch.zeros_like(params[-1]) ] *
+            (self.world_size - nparams % self.world_size)
 
             # Reduce lookups overhead
             momentum = group['momentum']
@@ -175,26 +170,26 @@ class DistributedMuon(Optimizer):
             ortho_steps = group['ortho_steps']
             lr = group['lr']
             weight_decay = group['weight_decay']
-            for i in range(0, nparams, world_size):
-                # No need to update for padded parameters
-                if i + rank < nparams:
+            for i in range(0, nparams, self.world_size):
+                # No need to update padded parameters
+                if i + self.rank < nparams:
                     # parameter and gradient
-                    p = params[i + rank]
+                    p = params[i + self.rank]
                     g = p.grad
                     if g is None:
                         # Force update for syncrhonization (unlikely)
                         g = torch.zeros_like(p)
 
                     state = self.state[p]
-                    if 'momentum_buf' not in state:
-                        state['momentum_buf'] = torch.zeros_like(g)
-                    buf = state['momentum_buf']
+                    if 'momentum_buff' not in state:
+                        state['momentum_buff'] = torch.zeros_like(g)
+                    buff = state['momentum_buff']
 
                     # buf = momentum * buf + (1 - momentum) * g
                     buf.lerp_(g, 1 - momentum)
 
                     # Nesterov momentum
-                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = g.lerp_(buff, momentum) if nesterov else buff
 
                     # Orthogonalize
                     g = _polar_express(g, steps=ortho_steps)
@@ -208,7 +203,11 @@ class DistributedMuon(Optimizer):
                     p.sub_(g.view_as(p), alpha=lr)
 
                 # Broadcast the updated parameter and gather other updated
-                # parameters from other processes.
-                dist.all_gather(params[i:i+world_size], params[i + rank])
+                # parameters from other processes. Also, append futures to wait
+                # for every all_gather operation to be completed.
+                futures.append(dist.all_gather(
+                    params[i:i+self.world_size], params[i + self.rank]
+                ).get_future())
 
-        return loss
+        # Wait for every all_gather function call to be completed.
+        torch.futures.collect_all(futures).wait()
