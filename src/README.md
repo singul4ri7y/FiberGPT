@@ -1,1 +1,0 @@
-FiberGPT implementation in PyTorch

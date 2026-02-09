@@ -1,27 +1,25 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+from utils.tokenizer import n_vocab
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# Use NVIDIA transformer_engine to train in FP8 if for B200 GPUs.
+import torch.nn.init as I
 
 
 @dataclass
 class FiberGPTConfig:
-    # GPT2 and GPT3 vocabulary size is 50257, rounded to 64-element boundary
-    # for efficiency.
-    n_vocab: int = 50304
-    context_length: int = 2048
-    n_layer: int = 32
-    n_head: int = 8
+    n_vocab: int = n_vocab
+    context_length: int = 1024
+    n_layer: int = 24
+    n_head: int = 16
     n_embd: int = 1024
     freq_base: int = 10000
     n_hidden: int = n_embd
     ffwd_dim_multiplier: int = 4
-    norm_eps: float = 1e-5
-    drop_prob: float = 0.0
+    norm_eps: float = 1e-9
+    weight_tying: bool = True
+    use_value_residuals: bool = True
 
 
 def rms_norm(x: torch.Tensor, eps: float):
@@ -56,7 +54,7 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, rope_cache: torch.Tensor):
 
 
 class CausalAttention(nn.Module):
-    ''' Casual multi-head attention. '''
+    ''' Causal multi-head attention. '''
 
     def __init__(self, config: FiberGPTConfig):
         super().__init__()
@@ -68,23 +66,28 @@ class CausalAttention(nn.Module):
         self.eps = config.norm_eps
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
-        
+
         # Fused linear transformation of key, query and value in the column
         # axis.
         self.attn_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
-        # Dropouts
-        self.drop_prob = config.drop_prob
-        self.proj_drop = nn.Dropout(self.drop_prob)
-
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        ve: Optional[torch.Tensor] = None,
+    ):
         B, T, C = x.size()
 
         qkv = self.attn_qkv(x)
         # Extract query, key and value from fused linear transformation
         q, k, v = qkv.chunk(3, dim=-1)  # (B, T, C), where C = n_embd
-        
+
+        # Apply value residual if available.
+        if ve is not None:
+            v = v + ve
+
         # Consider each head is concatenated in column axis. So, we might end up
         # with something like this:
         #   [[ H1, H1, H1, H2, H2, H2 ],
@@ -118,32 +121,29 @@ class CausalAttention(nn.Module):
         # The final tensor shape should be (B, nh, T, hs).
         q = q.view(B, T, self.n_head, self.head_size)
         k = k.view(B, T, self.n_head, self.head_size)
-        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_size)
 
         # Apply RoPE before transposition.
         q, k = _apply_rope(q, k, rope_cache)
-        q, k = rms_norm(q, self.eps), rms_norm(k, self.eps)
-        q, k = q.transpose(1, 2), k.transpose(1, 2)
+        q, k = rms_norm(q, self.eps), rms_norm(k, self.eps)  # QK norm
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # Apply attention
         y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=self.drop_prob if self.training else 0,
-            is_causal=True
+            q, k, v, attn_mask=None, is_causal=True
         )  # (B, nh, T, hs)
 
         # Re-assemble the output.
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.proj_drop(self.proj(y))
-    
+        return self.proj(y)
+
 
 class FeedForward(nn.Module):
     ''' Feed forward layer in decoder transformer block. '''
 
     def __init__(self, config: FiberGPTConfig):
         super().__init__()
-    
+
         hidden_dim = int(config.n_hidden * config.ffwd_dim_multiplier)
 
         # One hidden layer and one projection layer
@@ -159,13 +159,18 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, config: FiberGPTConfig):
         super().__init__()
-    
+
         self.eps = config.norm_eps
         self.attn = CausalAttention(config)
         self.ffwd = FeedForward(config)
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor):
-        h = x + self.attn(rms_norm(x, self.eps), rope_cache)
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        ve: Optional[torch.Tensor] = None,
+    ):
+        h = x + self.attn(rms_norm(x, self.eps), rope_cache, ve)
         return h + self.ffwd(rms_norm(h, self.eps))
 
 
@@ -188,6 +193,16 @@ class FiberGPT(nn.Module):
             base = config.freq_base
         ), persistent=False)
 
+        # Inspired by ResFormer. Value residual learning, but with value
+        # embeddings and gate network.
+        if config.use_value_residuals:
+            self.value_embedding = nn.Embedding(config.n_vocab, config.n_embd)
+
+            # Gate projection with bias seems to perform better
+            self.v_gate = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        else:
+            self.value_embedding = None
+
         # Decoder blocks
         self.dec_blocks = nn.ModuleList(
             [ TransformerBlock(config) for _ in range(config.n_layer) ]
@@ -195,6 +210,43 @@ class FiberGPT(nn.Module):
 
         # Projection
         self.proj = nn.Linear(config.n_embd, config.n_vocab, bias=False)
+
+        # Weight tying
+        if config.weight_tying:
+            self.proj.weight = self.token_embedding.weight
+
+        # Initialize parameters
+        self._init_params(config)
+
+    @torch.no_grad()
+    def _init_params(self, config: FiberGPTConfig):
+        # Embedding
+        I.normal_(self.token_embedding.weight, mean=0.0, std=config.n_embd ** -0.5)
+        if not config.weight_tying:
+            I.normal_(self.token_embedding.weight, mean=0.0, std=1.0)
+            I.normal_(self.proj.weight, mean=0.0, std=0.001)
+
+        # Blocks
+        # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        s = (3 / config.n_embd) ** 0.5
+
+        for block in self.dec_blocks:
+            # Attention
+            I.uniform_(block.attn.attn_qkv.weight, -s, s)
+            I.zeros_(block.attn.proj.weight)
+
+            # MLP
+            I.uniform_(block.ffwd.hl.weight, -s, s)
+            I.zeros_(block.ffwd.proj.weight)
+
+        if config.use_value_residuals:
+            I.uniform_(self.value_embedding.weight, -s, s)
+            I.uniform_(self.v_gate.weight, -s, s)
+
+        # Move token and value embeddings to bfloat16.
+        if self._device().type == 'cuda':
+            self.token_embedding.weight.to(dtype=torch.bfloat16)
+            self.value_embedding.weight.to(dtype=torch.bfloat16)
 
     def _compute_rope_cache(
         self,
@@ -215,7 +267,7 @@ class FiberGPT(nn.Module):
         #  [ x2' ]]    [ sin(m * theta),  cos(m * theta) ]]   [ x2 ]]
         #
         # For a 2D positional embedding vector.
-        
+
         # theta = 1 / (base ** (2 * i / head_dim)),
         # where i ∈ { 0, ..., (d_model / 2) - 1 },
         # signifying ith vector element.
@@ -235,13 +287,13 @@ class FiberGPT(nn.Module):
         #
         # Where m ∈ { 0, 1 }, which can also be written as follows:
         # [[ x1' ],   [[ cos(m * theta1) ],   [[ x1 ],   [[ sin(m * theta1) ],   [[ -x2 ],
-        #  [ x2' ], =  [ cos(m * theta1) ], *  [ x2 ], +  [ sin(m * theta1) ], *  [  x1 ], 
+        #  [ x2' ], =  [ cos(m * theta1) ], *  [ x2 ], +  [ sin(m * theta1) ], *  [  x1 ],
         #  [ x3' ],    [ cos(m * theta2) ],    [ x3 ],    [ sin(m * theta2) ],    [ -x4 ],
         #  [ x4' ]]    [ cos(m * theta2) ]]    [ x4 ]]    [ sin(m * theta2) ]]    [  x3 ]]
         #
         # The repetition of the theta can be obtained by reshaping to (..., 1)
         # and braodcasting.
-        
+
         # Compute m * theta, where `m` is the position index.
         m_theta = torch.outer(torch.arange(
             context_length,
@@ -259,7 +311,7 @@ class FiberGPT(nn.Module):
         # blocks.
 
         return torch.polar(torch.ones_like(m_theta), m_theta)  # complex64
-    
+
     def _device(self):
         return self.token_embedding.weight.device
 
@@ -271,7 +323,7 @@ class FiberGPT(nn.Module):
             params += p.numel()
 
         return params
-    
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -285,12 +337,26 @@ class FiberGPT(nn.Module):
         rope_cache = self.rope_cache
         if T < self.context_length:
             rope_cache = rope_cache[:T]
-        
+
         x = self.token_embedding(tokens)
 
         # Propagate decoder blocks
-        for blk in self.dec_blocks:
-            x = blk(x, rope_cache)
+        ve = None
+        if self.value_embedding is not None:
+            ve = self.value_embedding(tokens)
+
+            # In Learnable-ResFormer, the lambdas get trained, but all value
+            # embedding feature (or vector dimension) is scaled with the same
+            # lambda. But applying residuals using gate network (with sigmoid)
+            # scales each features individually.
+            #
+            # Here, 1 -> Don't scale the feature, >1 -> Scale up feature, make it
+            # dominant, <1 -> Scale down feature, make it less dominant.
+            gate = 2 * F.sigmoid(self.v_gate(x))  # range (0, 2)
+            ve = gate * ve
+
+        for i, block in enumerate(self.dec_blocks):
+            x = block(x, rope_cache, ve)
 
         # projection
         logits = self.proj(rms_norm(x, self.eps))
@@ -340,7 +406,7 @@ class FiberGPT(nn.Module):
                 values, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
                 # Zero out the probabilties not top-N during softmax.
                 logits[logits < v[:, [-1]]] = float('-inf')
-            
+
             # Apply temperature
             if temperature > 0:
                 logits /= temperature
@@ -353,4 +419,3 @@ class FiberGPT(nn.Module):
             idx = torch.concat([idx, next_token], dim=1)
 
             yield next_token.item()
-
