@@ -1,10 +1,12 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
-from utils.tokenizer import n_vocab
+from re import L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as I
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+from utils.tokenizer import n_vocab
+from utils.attention import flash_attn_func
 
 
 @dataclass
@@ -20,6 +22,10 @@ class FiberGPTConfig:
     norm_eps: float = 1e-9
     weight_tying: bool = True
     use_value_residuals: bool = True
+    # Sliding window attention pattern string
+    # S = Small, M = Medium (half context), L = Large (full context)
+    # Patterns are repeated throughout the layers.
+    window_pattern: str = 'SSML'
 
 
 def rms_norm(x: torch.Tensor, eps: float):
@@ -77,6 +83,7 @@ class CausalAttention(nn.Module):
         x: torch.Tensor,
         rope_cache: torch.Tensor,
         ve: Optional[torch.Tensor] = None,
+        window_size: Tuple[int] = (-1, -1)
     ):
         B, T, C = x.size()
 
@@ -126,15 +133,15 @@ class CausalAttention(nn.Module):
         # Apply RoPE before transposition.
         q, k = _apply_rope(q, k, rope_cache)
         q, k = rms_norm(q, self.eps), rms_norm(k, self.eps)  # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # Apply attention
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True
-        )  # (B, nh, T, hs)
+        y = flash_attn_func(
+            q, k, v,
+            causal=True, window_size=window_size
+        )  # (B, T, nh, hs)
 
         # Re-assemble the output.
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = y.contiguous().view(B, T, C)
         return self.proj(y)
 
 
@@ -169,8 +176,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         rope_cache: torch.Tensor,
         ve: Optional[torch.Tensor] = None,
+        window_size: Tuple[int] = (-1, -1)
     ):
-        h = x + self.attn(rms_norm(x, self.eps), rope_cache, ve)
+        h = x + self.attn(rms_norm(x, self.eps), rope_cache, ve, window_size)
         return h + self.ffwd(rms_norm(h, self.eps))
 
 
@@ -192,6 +200,9 @@ class FiberGPT(nn.Module):
             config.context_length,
             base = config.freq_base
         ), persistent=False)
+
+        # Window sizes for sliding window attention
+        self.window_sizes = self._compute_window_sizes(config)
 
         # Inspired by ResFormer. Value residual learning, but with value
         # embeddings and gate network.
@@ -245,8 +256,8 @@ class FiberGPT(nn.Module):
 
         # Move token and value embeddings to bfloat16.
         if self._device().type == 'cuda':
-            self.token_embedding.weight.to(dtype=torch.bfloat16)
-            self.value_embedding.weight.to(dtype=torch.bfloat16)
+            self.token_embedding.weight = self.token_embedding.weight.bfloat16()
+            self.value_embedding.weight = self.value_embedding.weight.bfloat16()
 
     def _compute_rope_cache(
         self,
@@ -312,6 +323,32 @@ class FiberGPT(nn.Module):
 
         return torch.polar(torch.ones_like(m_theta), m_theta)  # complex64
 
+    def _compute_window_sizes(self, config: FiberGPTConfig):
+        '''
+        Compute per layer window sizes.
+
+        S = Small, 1/4 of the context length
+        M = Medium, half the context length
+        L = Large, full context length
+        '''
+
+        # Layer count should be divisible by pattern char count
+        pattern = config.window_pattern.upper()
+        assert config.n_layer % len(pattern) == 0
+        assert all(c in 'SML' for c in pattern), f'Invalid window pattern {pattern}'
+
+        windows = {
+            'L': (config.n_embd, 0),
+            'M': (config.n_embd // 2, 0),
+            'S': (config.n_embd // 4, 0)
+        }
+
+        window_sizes = []
+        for i in range(config.n_layer):
+            window_sizes.append(windows[pattern[i % len(pattern)]])
+
+        return window_sizes
+
     def _device(self):
         return self.token_embedding.weight.device
 
@@ -356,7 +393,7 @@ class FiberGPT(nn.Module):
             ve = gate * ve
 
         for i, block in enumerate(self.dec_blocks):
-            x = block(x, rope_cache, ve)
+            x = block(x, rope_cache, ve, self.window_sizes[i])
 
         # projection
         logits = self.proj(rms_norm(x, self.eps))
@@ -405,7 +442,7 @@ class FiberGPT(nn.Module):
             if top_k is not None:
                 values, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
                 # Zero out the probabilties not top-N during softmax.
-                logits[logits < v[:, [-1]]] = float('-inf')
+                logits[logits < values[:, [-1]]] = float('-inf')
 
             # Apply temperature
             if temperature > 0:
