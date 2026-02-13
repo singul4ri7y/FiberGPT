@@ -53,9 +53,15 @@ for param in orig_model.parameters():
 
 # Optimizers
 optims = model.setup_optimizers()  # Use the default optimizer parameters
+opt_params = lambda opt: [p for group in opt.param_groups for p in group['params']]
+opt_params = {
+    optim: opt_params(optim) for optim in optims
+}
 
-def optim_step():
+def optim_step(opt_futures):
     for optim in optims:
+        # Wait for ALL REDUCE operation to complete
+        torch.futures.collect_all(opt_futures[optim]).wait()
         optim.step()
 
 def optim_zero_grad():
@@ -130,13 +136,21 @@ for step in range(MAX_ITER + 1):
         train_loss += loss.item()
         loss.backward()
 
+    opt_futures = {
+        opt: [
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
+            for p in params
+        ]
+        for opt, params in opt_params.items()
+    }
+
     optim_update_params(
         get_lr_multiplier(step),
         get_muon_momentum(step),
         get_weight_decay(step)
     )
 
-    optim_step()
+    optim_step(opt_futures)
     optim_zero_grad()
 
     sync()
