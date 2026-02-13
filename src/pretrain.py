@@ -80,12 +80,12 @@ def optim_update_params(lrm: float, momentum: float, weight_decay: float):
 
 # Initialize dataloaders for train and val
 train_loader = DDGPretrain(
-    'data/fineweb_train_*.bin',
-    BATCH_SIZE, local_rank, world_size
+    'data/fineweb10b/fineweb_train_*.bin',
+    BATCH_SIZE, CONTEXT_LENGTH, local_rank, world_size
 )
 val_loader = DDGPretrain(
-    'data/fineweb_val_*.bin',
-    BATCH_SIZE, local_rank, world_size
+    'data/fineweb10b/fineweb_val_*.bin',
+    BATCH_SIZE, CONTEXT_LENGTH, local_rank, world_size
 )
 
 

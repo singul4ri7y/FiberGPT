@@ -372,8 +372,8 @@ class FiberGPT(nn.Module):
         muon_weight_decay: float = 0.01,
         muon_momentum: float = 0.95
     ):
-        embedding_params = self.token_embedding.parameters()
-        matrix_params = self.dec_blocks.parameters()
+        embedding_params = list(self.token_embedding.parameters())
+        matrix_params = list(self.dec_blocks.parameters())
         value_params = list(self.value_embedding.parameters())
         gate_params = list(self.v_gate.parameters())
 

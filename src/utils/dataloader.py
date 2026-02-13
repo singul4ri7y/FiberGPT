@@ -1,18 +1,15 @@
 # Simple dataloader inspired by modded-nanogpt
 
 import torch
-import numpy as np
-import threading
 import random
 from pathlib import Path
-from utils.tokenizer import tokenizer, _extended_special_tokens
 
 
 def _load_data_shard(file: Path):
     # Read the header
     header = torch.from_file(
         str(file),
-        shareded=False,
+        shared=False,
         size=256,
         dtype=torch.int32
     )
@@ -42,7 +39,7 @@ def _shuffled_files_cycle(files):
 # Distributed Data Generator for pretraining
 def DDGPretrain(
     filename_pattern: str,
-    batch_size: int,
+    batch_size: int, context_length: int,
     rank: int, world_size: int
 ):
     files = sorted(Path.cwd().glob(filename_pattern))
@@ -64,10 +61,10 @@ def DDGPretrain(
         buff = tokens[pos + rank * local_batch_size:][:local_batch_size+1]
         inputs = buff[:-1].to(
             device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
-        )
+        ).view(-1, context_length)
         targets = buff[1:].to(
             device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
-        )
+        ).view(-1, context_length)
 
         pos += batch_size
         yield inputs, targets

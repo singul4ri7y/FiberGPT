@@ -161,8 +161,8 @@ class DistributedMuon(Optimizer):
             params = group['params']
             nparams = len(params)  # non padded length
             # Make parameter count divisible by world size.
-            params = params + [ torch.zeros_like(params[-1]) ] *
-            (self.world_size - nparams % self.world_size)
+            params = params + ([ torch.zeros_like(params[-1]) ] *
+                (self.world_size - nparams % self.world_size))
 
             # Reduce lookups overhead
             momentum = group['momentum']
