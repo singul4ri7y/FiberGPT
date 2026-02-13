@@ -39,8 +39,8 @@ def _shuffled_files_cycle(files):
         random.shuffle(files)
 
 
-# Distributed Data Generator
-def DDG(
+# Distributed Data Generator for pretraining
+def DDGPretrain(
     filename_pattern: str,
     batch_size: int,
     rank: int, world_size: int
@@ -57,7 +57,7 @@ def DDG(
 
     while True:
         # If this shard is exhausted
-        if pos + batch_size + 1 >= tokens_len:
+        if pos + batch_size + 1 >= tokens_size:
             tokens = _load_data_shard(next(file_iter))
             tokens_size = len(tokens)
 

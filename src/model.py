@@ -1,12 +1,14 @@
-from re import L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as I
+from torch.optim import AdamW
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 from utils.tokenizer import n_vocab
 from utils.attention import flash_attn_func
+from utils.muon import Muon, DistributedMuon
+from utils.common import is_dist_requested
 
 
 @dataclass
@@ -188,13 +190,13 @@ class FiberGPT(nn.Module):
     def __init__(self, config: FiberGPTConfig):
         super().__init__()
 
-        self.token_embedding = nn.Embedding(config.n_vocab, config.n_embd)
-
-        # eps for `rms_norm`
+        # Cache required configs
+        self.context_length = config.context_length
         self.eps = config.norm_eps
 
+        self.token_embedding = nn.Embedding(config.n_vocab, config.n_embd)
+
         # Compute rope cache
-        self.context_length = config.context_length
         self.register_buffer('rope_cache', self._compute_rope_cache(
             config.n_embd // config.n_head,
             config.context_length,
@@ -360,6 +362,60 @@ class FiberGPT(nn.Module):
             params += p.numel()
 
         return params
+
+    def setup_optimizers(
+        self,
+        embedding_lr: float = 0.2, proj_lr: float = 6e-4,
+        value_lr: float = 3e-4,
+        matrix_lr: float = 0.02,
+        adam_betas=(0.9, 0.95),
+        muon_weight_decay: float = 0.01,
+        muon_momentum: float = 0.95
+    ):
+        embedding_params = self.token_embedding.parameters()
+        matrix_params = self.dec_blocks.parameters()
+        value_params = list(self.value_embedding.parameters())
+        gate_params = list(self.v_gate.parameters())
+
+        # Make sure we covered all the parameters
+        assert (len(list(self.parameters())) == len(embedding_params) +
+            len(matrix_params) + len(value_params) + len(gate_params))
+
+        # If weights are tied
+        if self.token_embedding.weight is self.proj.weight:
+            adamw_param_groups = [
+                dict(params=embedding_params, lr=proj_lr),
+                dict(params=value_params + gate_params, lr=value_lr)
+            ]
+        else:
+            adamw_param_groups = [
+                dict(params=embedding_params, lr=embedding_lr),
+                dict(params=self.proj.parameters(), lr=proj_lr),
+                dict(params=value_params + gate_params, lr=value_lr)
+            ]
+
+        optim_adamw = AdamW(
+            adamw_param_groups,
+            betas=adam_betas,
+            weight_decay=0.0
+        )
+
+        # TODO: Sort matrix parameters in terms of sizes
+        MuonFactory = DistributedMuon if is_dist_requested() else Muon
+        optim_muon = MuonFactory(
+            matrix_params,
+            lr=matrix_lr,
+            weight_decay=muon_weight_decay,
+            momentum=muon_momentum
+        )
+
+        # Set initial learning rate.
+        for group in optim_adamw.param_groups:
+            group['initial_lr'] = group['lr']
+        for group in optim_muon.param_groups:
+            group['initial_lr'] = group['lr']
+
+        return optim_adamw, optim_muon
 
     def forward(
         self,
