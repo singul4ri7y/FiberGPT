@@ -340,9 +340,9 @@ class FiberGPT(nn.Module):
         assert all(c in 'SML' for c in pattern), f'Invalid window pattern {pattern}'
 
         windows = {
-            'L': (config.n_embd, 0),
-            'M': (config.n_embd // 2, 0),
-            'S': (config.n_embd // 4, 0)
+            'L': (config.context_length, 0),
+            'M': (config.context_length // 2, 0),
+            'S': (config.context_length // 4, 0)
         }
 
         window_sizes = []

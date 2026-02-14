@@ -39,14 +39,15 @@ def _shuffled_files_cycle(files):
 # Distributed Data Generator for pretraining
 def DDGPretrain(
     filename_pattern: str,
-    batch_size: int, context_length: int,
+    device_batch_length: int, context_length: int,
     rank: int, world_size: int
 ):
-    files = sorted(Path.cwd().glob(filename_pattern))
-    assert batch_size % world_size == 0, ('Batch size should be multiple of '
-        'world_size')
+    assert device_batch_length % world_size == 0, ('Batch size should be '
+        'multiple of world_size')
 
-    local_batch_size = batch_size // world_size
+    files = sorted(Path.cwd().glob(filename_pattern))
+    device_batch_size = device_batch_length * context_length
+    batch_size = device_batch_size * world_size  # Total batch size in tokens
     file_iter = _shuffled_files_cycle(files)
     tokens = _load_data_shard(next(file_iter))
     tokens_size = len(tokens)
@@ -57,14 +58,15 @@ def DDGPretrain(
         if pos + batch_size + 1 >= tokens_size:
             tokens = _load_data_shard(next(file_iter))
             tokens_size = len(tokens)
+            pos = 0
 
-        buff = tokens[pos + rank * local_batch_size:][:local_batch_size+1]
+        buff = tokens[pos + rank * device_batch_size:][:device_batch_size+1]
         inputs = buff[:-1].to(
             device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
-        ).view(-1, context_length)
+        ).view(device_batch_length, context_length)
         targets = buff[1:].to(
             device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
-        ).view(-1, context_length)
+        ).view(device_batch_length, context_length)
 
         pos += batch_size
         yield inputs, targets

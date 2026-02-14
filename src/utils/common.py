@@ -3,6 +3,7 @@
 import os
 import torch
 import torch.distributed as dist
+from utils.muon import Muon, DistributedMuon
 
 
 def print0(*args,**kwargs):
@@ -68,3 +69,19 @@ def compute_init(device_type='cuda'):
 def compute_cleanup():
     if is_dist_initialized():
         dist.destroy_process_group()
+
+
+def save_model(model, optims, eval_loss_record, name='fibergpt_pretrain_save.bin'):
+    adamw_state_dict, muon_state_dict = None, None
+    for optim in optims:
+        if isinstance(optim, (Muon, DistributedMuon)):
+            muon_state_dict = optim.state_dict()
+        else:
+            adamw_state_dict = optim.state_dict()
+
+    torch.save({
+        'model': model.state_dict(),
+        'optim_adam': adamw_state_dict,
+        'optim_muon': muon_state_dict,
+        'loss_list': eval_loss_record
+    }, name)

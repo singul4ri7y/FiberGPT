@@ -186,7 +186,7 @@ class DistributedMuon(Optimizer):
                     buff = state['momentum_buff']
 
                     # buf = momentum * buf + (1 - momentum) * g
-                    buf.lerp_(g, 1 - momentum)
+                    buff.lerp_(g, 1 - momentum)
 
                     # Nesterov momentum
                     g = g.lerp_(buff, momentum) if nesterov else buff
@@ -206,7 +206,8 @@ class DistributedMuon(Optimizer):
                 # parameters from other processes. Also, append futures to wait
                 # for every all_gather operation to be completed.
                 futures.append(dist.all_gather(
-                    params[i:i+self.world_size], params[i + self.rank]
+                    params[i:i+self.world_size], params[i + self.rank],
+                    async_op=True
                 ).get_future())
 
         # Wait for every all_gather function call to be completed.

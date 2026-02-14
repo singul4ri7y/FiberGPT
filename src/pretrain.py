@@ -4,28 +4,37 @@ import math
 import time
 import gc
 from model import FiberGPT, FiberGPTConfig
-from utils.common import compute_init, compute_cleanup, print0
+from utils.common import compute_init, compute_cleanup, print0, save_model
 from utils.attention import fa3_available
 from utils.dataloader import DDGPretrain
 from utils.muon import Muon, DistributedMuon
+from utils.tokenizer import tokenizer
 
 
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Are we going distribtued?
 distributed, rank, local_rank, world_size, device = compute_init(device_type)
+master_process = rank == 0
 
 
 # HYPERPARAMETERS
 CONTEXT_LENGTH = FiberGPTConfig.context_length
 BATCH_SIZE = 1_048_576  # ~1M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
-NO_OF_DEVICE_BATCH = 32  # Change this based on GPU VRAM
-GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_DEVICE_BATCH
+NO_OF_BATCH_PER_DEVICE = 32  # Change this based on GPU VRAM
+GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
+
 # Training hyperparams
 MAX_ITER = 10_000  # Roughly enough to go through the entire dataset
 WARMUP_ITER_RATIO = 0.01
 WARMDOWN_ITER_RATIO = 0.5
 FINAL_LR_RATIO = 0.1
+
+# Sample, eval and checkpoint
+SAMPLE_EVERY = 500
+EVAL_EVERY = 500
+EVAL_STEPS = 25
+CHECKPOINT_EVERY = 500
 
 
 # Warn if FA3 is not available.
@@ -38,17 +47,18 @@ if not fa3_available:
 
 # Training states
 autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda:None
+sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 
 
 # Compile the model
 orig_model = FiberGPT(FiberGPTConfig()).to(device)
 model = torch.compile(orig_model, dynamic=False, fullgraph=True)
 
-# Broadcast parameters from rank 0 cosntructed model, so that all the processes
-# share the same parameters.
-for param in orig_model.parameters():
-    dist.broadcast(param.detach(), 0)
+# Broadcast parameters from rank 0 constructed model, so that all the processes
+# share the same parameters. Only for distributed training.
+if distributed:
+    for param in orig_model.parameters():
+        dist.broadcast(param.detach(), 0)
 
 
 # Optimizers
@@ -58,10 +68,11 @@ opt_params = {
     optim: opt_params(optim) for optim in optims
 }
 
-def optim_step(opt_futures):
+def optim_step(optim_futures):
     for optim in optims:
         # Wait for ALL REDUCE operation to complete
-        torch.futures.collect_all(opt_futures[optim]).wait()
+        if optim_futures is not None:
+            torch.futures.collect_all(optim_futures[optim]).wait()
         optim.step()
 
 def optim_zero_grad():
@@ -69,6 +80,7 @@ def optim_zero_grad():
         optim.zero_grad(set_to_none=True)
 
 def optim_update_params(lrm: float, momentum: float, weight_decay: float):
+    res = [ None ] * 2
     for optim in optims:
         for group in optim.param_groups:
             group['lr'] = group['initial_lr'] * lrm
@@ -77,15 +89,20 @@ def optim_update_params(lrm: float, momentum: float, weight_decay: float):
                 group['momentum'] = momentum
                 group['weight_decay'] = weight_decay
 
+                res[1] = group['lr']
+            else: res[0] = group['lr']  # AdamW lr
+
+    return tuple(res)
+
 
 # Initialize dataloaders for train and val
 train_loader = DDGPretrain(
     'data/fineweb10b/fineweb_train_*.bin',
-    BATCH_SIZE, CONTEXT_LENGTH, local_rank, world_size
+    NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH, rank, world_size
 )
-val_loader = DDGPretrain(
+eval_loader = DDGPretrain(
     'data/fineweb10b/fineweb_val_*.bin',
-    BATCH_SIZE, CONTEXT_LENGTH, local_rank, world_size
+    NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH, rank, world_size
 )
 
 
@@ -102,7 +119,7 @@ def get_lr_multiplier(it: int):
         return 1.0
 
     # Cosine decay
-    decay_ratio = (MAX_ITER - warmdown_iter) / warmdown_iter
+    decay_ratio = (it - (MAX_ITER - warmdown_iter)) / warmdown_iter
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return FINAL_LR_RATIO + coeff * (1.0 - FINAL_LR_RATIO)
 
@@ -119,43 +136,125 @@ def get_weight_decay(it: int):
     return 0.1 * (1 - it / MAX_ITER)
 
 
+# Sample prompts
+sample_prompts = [
+    'The capital of France is',
+    'The chemical symbol of gold is',
+    'If yesterday was Friday, then tomorrow will be',
+    'The opposite of hot is',
+    'The planets of the solar system are:',
+    'My favorite color is',
+    'If 5*x + 3 = 13, then x is',
+]
+
+
+# Tensor to store validation loss
+eval_loss_record = torch.tensor([], dtype=torch.float32)
+
+
 # Godspeed!
 for step in range(MAX_ITER + 1):
     last_step = step == MAX_ITER
 
+    # Evaluate validation loss
+    if last_step or (step > 0 and step % EVAL_EVERY == 0):
+        # All processes should perform the evaluation.
+        if distributed:
+            dist.barrier()
+        model.eval()
+
+        eval_loss = 0
+        with torch.no_grad(), autocast_ctx:
+            for _ in range(EVAL_STEPS):
+                for _ in range(GRAD_ACCUM_STEPS):
+                    inputs, targets = next(eval_loader)
+                    eval_loss += model.forward(inputs, targets)
+
+        eval_loss /= EVAL_STEPS * GRAD_ACCUM_STEPS
+
+        if distributed:
+            dist.all_reduce(eval_loss, op=dist.ReduceOp.AVG)
+
+        # Record and report validation loss
+        eval_loss_record = torch.cat(
+            (eval_loss_record, eval_loss.cpu().view(1)),
+            dim=0
+        )
+        print0(f'{step=} evaluation loss: {eval_loss.item():.4f}')
+
+        model.train()
+        if distributed:
+            dist.barrier()
+
+    # Sample some tokens once in a while
+    if last_step or (step > 0 and step % SAMPLE_EVERY == 0):
+        if master_process:
+            model.eval()
+
+            with torch.no_grad(), autocast_ctx:
+                for prompt in sample_prompts:
+                    print0(f'Sample 1: {prompt}')
+
+                    tokens = tokenizer.encode(prompt)
+                    y = model.generate(tokens, 32)
+
+                    for token in y:
+                        print0(tokenizer.decode([token]))
+                    print0(end='\n\n')
+
+            model.train()
+
+        if distributed:
+            dist.barrier()
+
+    # Save the model once in a while
+    if step > 0 and step % CHECKPOINT_EVERY == 0:
+        save_model(model, optims, eval_loss_record)
+
     # Single training step
-    sync()
     t0 = time.perf_counter()
-    inputs, targets = next(train_loader)
     # Train loss for logging
     train_loss = 0.0
     for _ in range(GRAD_ACCUM_STEPS):
+        inputs, targets = next(train_loader)
         with autocast_ctx:
-            loss = model(inputs, targets)
+            loss = model.forward(inputs, targets)
         loss /= GRAD_ACCUM_STEPS
         train_loss += loss.item()
         loss.backward()
 
-    opt_futures = {
-        opt: [
-            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
-            for p in params
-        ]
-        for opt, params in opt_params.items()
-    }
+    optim_futures = None
+    if distributed:
+        optim_futures = {
+            opt: [
+                dist.all_reduce(
+                    p.grad, op=dist.ReduceOp.AVG, async_op=True
+                ).get_future()
+                for p in params
+            ]
+            for opt, params in opt_params.items()
+        }
 
-    optim_update_params(
+    adamw_lr, muon_lr = optim_update_params(
         get_lr_multiplier(step),
         get_muon_momentum(step),
         get_weight_decay(step)
     )
 
-    optim_step(opt_futures)
+    optim_step(optim_futures)
     optim_zero_grad()
 
     sync()
 
     t1 = time.perf_counter()
+    dt = t1 - t0
+    tps = BATCH_SIZE / dt
+
+    print0(f'{step=}, {train_loss=:.4f}, {adamw_lr=:.4f}, {muon_lr=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps:d}')
+
+    # Save the model in final step
+    if last_step:
+        save_model(model, optims, eval_loss_record, 'fibergpt_pretrain.bin')
 
     if step == 0:
         gc.collect()

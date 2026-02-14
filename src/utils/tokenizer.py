@@ -1,5 +1,5 @@
-# Custom tokenizer based on GPT2 tokenizer, but with some extra special
-# tokens.
+# Custom wrapper based on GPT2 tokenizer, but with some extra special
+# tokens and helper functions.
 
 import tiktoken as tk
 
