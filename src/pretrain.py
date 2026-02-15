@@ -3,6 +3,7 @@ import torch.distributed as dist
 import math
 import time
 import gc
+from torch.nn.parallel import DistributedDataParallel
 from model import FiberGPT, FiberGPTConfig
 from utils.common import compute_init, compute_cleanup, print0, save_model
 from utils.attention import fa3_available
@@ -52,27 +53,24 @@ sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 
 # Compile the model
 orig_model = FiberGPT(FiberGPTConfig()).to(device)
-model = torch.compile(orig_model, dynamic=False, fullgraph=True)
+compiled_model = torch.compile(orig_model, dynamic=False, fullgraph=True)
+model = compiled_model
 
-# Broadcast parameters from rank 0 constructed model, so that all the processes
-# share the same parameters. Only for distributed training.
+# Wrap model in DDP
 if distributed:
-    for param in orig_model.parameters():
-        dist.broadcast(param.detach(), 0)
+    model = DistributedDataParallel(
+        model,
+        device_ids=[ local_rank ],
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True
+    )
 
 
 # Optimizers
 optims = model.setup_optimizers()  # Use the default optimizer parameters
-opt_params = lambda opt: [p for group in opt.param_groups for p in group['params']]
-opt_params = {
-    optim: opt_params(optim) for optim in optims
-}
 
-def optim_step(optim_futures):
+def optim_step():
     for optim in optims:
-        # Wait for ALL REDUCE operation to complete
-        if optim_futures is not None:
-            torch.futures.collect_all(optim_futures[optim]).wait()
         optim.step()
 
 def optim_zero_grad():
@@ -153,16 +151,14 @@ for step in range(MAX_ITER + 1):
     # Evaluate validation loss
     if last_step or (step > 0 and step % EVAL_EVERY == 0):
         # All processes should perform the evaluation.
-        if distributed:
-            dist.barrier()
         model.eval()
 
-        eval_loss = 0
+        eval_loss = torch.tensor(0.0, device=device)
         with torch.no_grad(), autocast_ctx:
             for _ in range(EVAL_STEPS):
                 for _ in range(GRAD_ACCUM_STEPS):
                     inputs, targets = next(eval_loader)
-                    eval_loss += model.forward(inputs, targets)
+                    eval_loss += model(inputs, targets)
 
         eval_loss /= EVAL_STEPS * GRAD_ACCUM_STEPS
 
@@ -177,57 +173,43 @@ for step in range(MAX_ITER + 1):
         print0(f'{step=} evaluation loss: {eval_loss.item():.4f}')
 
         model.train()
-        if distributed:
-            dist.barrier()
 
     # Sample some tokens once in a while
-    if last_step or (step > 0 and step % SAMPLE_EVERY == 0):
-        if master_process:
-            model.eval()
+    if master_process and (last_step or (step > 0 and step % SAMPLE_EVERY == 0)):
+        model.eval()
 
-            with torch.no_grad(), autocast_ctx:
-                for i, prompt in enumerate(sample_prompts):
-                    print0(f'Sample {i + 1}: {prompt}', end='')
+        with torch.no_grad(), autocast_ctx:
+            for i, prompt in enumerate(sample_prompts):
+                print0(f'Sample {i + 1}: {prompt}', end='')
 
-                    tokens = tokenizer.encode(prompt)
-                    y = model.generate(tokens, 32)
+                tokens = tokenizer.encode(prompt)
+                y = compiled_model.generate(tokens, 32)
 
-                    for token in y:
-                        print0(tokenizer.decode([token]), end='')
-                    print0(end='\n\n')
+                for token in y:
+                    print0(tokenizer.decode([token]), end='')
+                print0(end='\n\n')
 
-            model.train()
-
-        if distributed:
-            dist.barrier()
+        model.train()
 
     # Save the model once in a while
-    if step > 0 and step % CHECKPOINT_EVERY == 0:
+    if master_process and (step > 0 and step % CHECKPOINT_EVERY == 0):
         save_model(orig_model, optims, eval_loss_record)
 
     # Single training step
     t0 = time.perf_counter()
     # Train loss for logging
     train_loss = 0.0
-    for _ in range(GRAD_ACCUM_STEPS):
+    for micro_step in range(GRAD_ACCUM_STEPS):
         inputs, targets = next(train_loader)
         with autocast_ctx:
-            loss = model.forward(inputs, targets)
+            loss = model(inputs, targets)
         loss /= GRAD_ACCUM_STEPS
         train_loss += loss.item()
-        loss.backward()
 
-    optim_futures = None
-    if distributed:
-        optim_futures = {
-            opt: [
-                dist.all_reduce(
-                    p.grad, op=dist.ReduceOp.AVG, async_op=True
-                ).get_future()
-                for p in params
-            ]
-            for opt, params in opt_params.items()
-        }
+        if distributed:
+            model.require_backward_grad_sync = micro_step + 1 == GRAD_ACCUM_STEPS
+
+        loss.backward()
 
     optim_update_params(
         get_lr_multiplier(step),
@@ -235,7 +217,7 @@ for step in range(MAX_ITER + 1):
         get_weight_decay(step)
     )
 
-    optim_step(optim_futures)
+    optim_step()
     optim_zero_grad()
 
     sync()
@@ -247,7 +229,7 @@ for step in range(MAX_ITER + 1):
     print0(f'{step=}, took={dt * 1000:.4f}ms, tok/sec={tps}')
 
     # Save the model in final step
-    if last_step:
+    if master_process and last_step:
         save_model(orig_model, optims, eval_loss_record, 'fibergpt_pretrain.bin')
 
     if step == 0:
