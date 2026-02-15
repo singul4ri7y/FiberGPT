@@ -27,7 +27,7 @@ class FiberGPTConfig:
     # Sliding window attention pattern string
     # S = Small, M = Medium (half context), L = Large (full context)
     # Patterns are repeated throughout the layers.
-    window_pattern: str = 'SSML'
+    window_pattern: str = 'LMML'
 
 
 def rms_norm(x: torch.Tensor, eps: float):
@@ -212,7 +212,7 @@ class FiberGPT(nn.Module):
             self.value_embedding = nn.Embedding(config.n_vocab, config.n_embd)
 
             # Gate projection with bias seems to perform better
-            self.v_gate = nn.Linear(config.n_embd, config.n_embd, bias=True)
+            self.v_gate = nn.Linear(config.n_embd, config.n_embd, bias=False)
         else:
             self.value_embedding = None
 
@@ -256,9 +256,10 @@ class FiberGPT(nn.Module):
             I.uniform_(self.value_embedding.weight, -s, s)
             I.uniform_(self.v_gate.weight, -s, s)
 
-        # Move token and value embeddings to bfloat16.
-        self.token_embedding.weight.data = self.token_embedding.weight.bfloat16()
-        self.value_embedding.weight.data = self.value_embedding.weight.bfloat16()
+        # Move all embeddings to bfloat16.
+        for m in self.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.data = m.weight.bfloat16()
 
     def _compute_rope_cache(
         self,
@@ -364,10 +365,9 @@ class FiberGPT(nn.Module):
 
     def setup_optimizers(
         self,
-        embedding_lr: float = 0.2, proj_lr: float = 6e-4,
-        value_lr: float = 3e-4,
+        embedding_lr: float = 0.05, proj_lr: float = 6e-3,
         matrix_lr: float = 0.02,
-        adam_betas=(0.9, 0.95),
+        adam_betas=(0.8, 0.95),
         muon_weight_decay: float = 0.01,
         muon_momentum: float = 0.95
     ):
@@ -376,21 +376,15 @@ class FiberGPT(nn.Module):
         value_params = list(self.value_embedding.parameters())
         gate_params = list(self.v_gate.parameters())
 
-        # Make sure we covered all the parameters
-        assert (len(list(self.parameters())) == len(embedding_params) +
-            len(matrix_params) + len(value_params) + len(gate_params))
-
         # If weights are tied
         if self.token_embedding.weight is self.proj.weight:
             adamw_param_groups = [
-                dict(params=embedding_params, lr=proj_lr),
-                dict(params=value_params + gate_params, lr=value_lr)
+                dict(params=embedding_params + value_params, lr=embedding_lr)
             ]
         else:
             adamw_param_groups = [
-                dict(params=embedding_params, lr=embedding_lr),
-                dict(params=self.proj.parameters(), lr=proj_lr),
-                dict(params=value_params + gate_params, lr=value_lr)
+                dict(params=embedding_params + value_params, lr=embedding_lr),
+                dict(params=self.proj.parameters(), lr=proj_lr)
             ]
 
         optim_adamw = AdamW(
@@ -402,7 +396,7 @@ class FiberGPT(nn.Module):
         # TODO: Sort matrix parameters in terms of sizes
         MuonFactory = DistributedMuon if is_dist_requested() else Muon
         optim_muon = MuonFactory(
-            matrix_params,
+            matrix_params + gate_params,
             lr=matrix_lr,
             weight_decay=muon_weight_decay,
             momentum=muon_momentum

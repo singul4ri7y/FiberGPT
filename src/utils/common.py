@@ -71,7 +71,7 @@ def compute_cleanup():
         dist.destroy_process_group()
 
 
-def save_model(model, optims, eval_loss_record, name='fibergpt_pretrain_save.bin'):
+def save_model(model, optims, eval_loss_record, name='fibergpt_save.bin'):
     adamw_state_dict, muon_state_dict = None, None
     for optim in optims:
         if isinstance(optim, (Muon, DistributedMuon)):

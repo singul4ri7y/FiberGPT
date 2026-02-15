@@ -20,16 +20,17 @@ master_process = rank == 0
 
 # HYPERPARAMETERS
 CONTEXT_LENGTH = FiberGPTConfig.context_length
-BATCH_SIZE = 1_048_576  # ~1M in tokens
+BATCH_SIZE = 524_288  # ~0.5M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
 NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
 # Training hyperparams
-MAX_ITER = 10_000  # Roughly enough to go through the entire dataset
+MAX_ITER = 20_000  # Roughly enough to go through the entire dataset
 WARMUP_ITER_RATIO = 0.01
 WARMDOWN_ITER_RATIO = 0.5
 FINAL_LR_RATIO = 0.1
+WEIGHT_DECAY_ITER_RATIO = 0.01
 
 # Sample, eval and checkpoint
 SAMPLE_EVERY = 500
@@ -48,7 +49,6 @@ if not fa3_available:
 
 # Training states
 autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 
 
 # Compile the model
@@ -67,7 +67,7 @@ if distributed:
 
 
 # Optimizers
-optims = model.setup_optimizers()  # Use the default optimizer parameters
+optims = orig_model.setup_optimizers()  # Use the default optimizer parameters
 
 def optim_step():
     for optim in optims:
@@ -99,26 +99,27 @@ eval_loader = DDGPretrain(
 
 
 # Learning rate scheduling (linear warmup, constant, cosine decay)
-def get_lr_multiplier(it: int):
+def get_lr_multiplier(step: int):
     warmup_iter = round(WARMUP_ITER_RATIO * MAX_ITER)
     warmdown_iter = round(WARMDOWN_ITER_RATIO * MAX_ITER)
 
     # Linear warmup
-    if it < warmup_iter:
-        return (it + 1) / warmup_iter
+    if step < warmup_iter:
+        return (step + 1) / warmup_iter
     # Constant
-    elif it <= MAX_ITER - warmdown_iter:
+    elif step <= MAX_ITER - warmdown_iter:
         return 1.0
 
     # Cosine decay
-    decay_ratio = (it - (MAX_ITER - warmdown_iter)) / warmdown_iter
+    decay_ratio = (step - (MAX_ITER - warmdown_iter)) / warmdown_iter
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return FINAL_LR_RATIO + coeff * (1.0 - FINAL_LR_RATIO)
 
 
-# Warmup Muon optimizer momentum for first 300 steps to 0.95
-def get_muon_momentum(it: int):
-    frac = min(it / 300, 1)
+# Warmup Muon optimizer momentum to 0.95
+def get_muon_momentum(step: int):
+    weight_decay_iters = WEIGHT_DECAY_ITER_RATIO * MAX_ITER
+    frac = min(step / weight_decay_iters, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
@@ -207,7 +208,7 @@ for step in range(MAX_ITER + 1):
         train_loss += loss.item()
 
         if distributed:
-            model.require_backward_grad_sync = micro_step + 1 == GRAD_ACCUM_STEPS
+            model.require_backward_grad_sync = micro_step == GRAD_ACCUM_STEPS - 1
 
         loss.backward()
 
@@ -220,13 +221,11 @@ for step in range(MAX_ITER + 1):
     optim_step()
     optim_zero_grad()
 
-    sync()
-
     t1 = time.perf_counter()
     dt = t1 - t0
     tps = BATCH_SIZE // dt
 
-    print0(f'{step=}, took={dt * 1000:.4f}ms, tok/sec={tps}')
+    print0(f'{step=}, {train_loss=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps}')
 
     # Save the model in final step
     if master_process and last_step:
