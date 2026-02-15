@@ -257,9 +257,8 @@ class FiberGPT(nn.Module):
             I.uniform_(self.v_gate.weight, -s, s)
 
         # Move token and value embeddings to bfloat16.
-        if self._device().type == 'cuda':
-            self.token_embedding.weight = self.token_embedding.weight.bfloat16()
-            self.value_embedding.weight = self.value_embedding.weight.bfloat16()
+        self.token_embedding.weight.data = self.token_embedding.weight.bfloat16()
+        self.value_embedding.weight.data = self.value_embedding.weight.bfloat16()
 
     def _compute_rope_cache(
         self,

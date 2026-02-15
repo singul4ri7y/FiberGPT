@@ -21,7 +21,7 @@ master_process = rank == 0
 CONTEXT_LENGTH = FiberGPTConfig.context_length
 BATCH_SIZE = 1_048_576  # ~1M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
-NO_OF_BATCH_PER_DEVICE = 32  # Change this based on GPU VRAM
+NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
 # Training hyperparams
@@ -80,7 +80,6 @@ def optim_zero_grad():
         optim.zero_grad(set_to_none=True)
 
 def optim_update_params(lrm: float, momentum: float, weight_decay: float):
-    res = [ None ] * 2
     for optim in optims:
         for group in optim.param_groups:
             group['lr'] = group['initial_lr'] * lrm
@@ -88,11 +87,6 @@ def optim_update_params(lrm: float, momentum: float, weight_decay: float):
             if isinstance(optim, (Muon, DistributedMuon)):
                 group['momentum'] = momentum
                 group['weight_decay'] = weight_decay
-
-                res[1] = group['lr']
-            else: res[0] = group['lr']  # AdamW lr
-
-    return tuple(res)
 
 
 # Initialize dataloaders for train and val
@@ -192,14 +186,14 @@ for step in range(MAX_ITER + 1):
             model.eval()
 
             with torch.no_grad(), autocast_ctx:
-                for prompt in sample_prompts:
-                    print0(f'Sample 1: {prompt}')
+                for i, prompt in enumerate(sample_prompts):
+                    print0(f'Sample {i + 1}: {prompt}', end='')
 
                     tokens = tokenizer.encode(prompt)
                     y = model.generate(tokens, 32)
 
                     for token in y:
-                        print0(tokenizer.decode([token]))
+                        print0(tokenizer.decode([token]), end='')
                     print0(end='\n\n')
 
             model.train()
@@ -209,7 +203,7 @@ for step in range(MAX_ITER + 1):
 
     # Save the model once in a while
     if step > 0 and step % CHECKPOINT_EVERY == 0:
-        save_model(model, optims, eval_loss_record)
+        save_model(orig_model, optims, eval_loss_record)
 
     # Single training step
     t0 = time.perf_counter()
@@ -235,7 +229,7 @@ for step in range(MAX_ITER + 1):
             for opt, params in opt_params.items()
         }
 
-    adamw_lr, muon_lr = optim_update_params(
+    optim_update_params(
         get_lr_multiplier(step),
         get_muon_momentum(step),
         get_weight_decay(step)
@@ -248,13 +242,13 @@ for step in range(MAX_ITER + 1):
 
     t1 = time.perf_counter()
     dt = t1 - t0
-    tps = BATCH_SIZE / dt
+    tps = BATCH_SIZE // dt
 
-    print0(f'{step=}, {train_loss=:.4f}, {adamw_lr=:.4f}, {muon_lr=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps:d}')
+    print0(f'{step=}, took={dt * 1000:.4f}ms, tok/sec={tps}')
 
     # Save the model in final step
     if last_step:
-        save_model(model, optims, eval_loss_record, 'fibergpt_pretrain.bin')
+        save_model(orig_model, optims, eval_loss_record, 'fibergpt_pretrain.bin')
 
     if step == 0:
         gc.collect()
