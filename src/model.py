@@ -365,9 +365,9 @@ class FiberGPT(nn.Module):
 
     def setup_optimizers(
         self,
-        embedding_lr: float = 0.05, proj_lr: float = 6e-3,
+        embedding_lr: float = 8e-3, proj_lr: float = 4e-3,
         matrix_lr: float = 0.02,
-        adam_betas=(0.8, 0.95),
+        adam_betas=(0.85, 0.95),
         muon_weight_decay: float = 0.01,
         muon_momentum: float = 0.95
     ):
@@ -376,24 +376,23 @@ class FiberGPT(nn.Module):
         value_params = list(self.value_embedding.parameters())
         gate_params = list(self.v_gate.parameters())
 
+        adamw_param_groups = [
+            dict(params=embedding_params + value_params, lr=embedding_lr)
+        ]
+
         # If weights are tied
         if self.token_embedding.weight is self.proj.weight:
-            adamw_param_groups = [
-                dict(params=embedding_params + value_params, lr=embedding_lr)
-            ]
-        else:
-            adamw_param_groups = [
-                dict(params=embedding_params + value_params, lr=embedding_lr),
+            adamw_param_groups.append(
                 dict(params=self.proj.parameters(), lr=proj_lr)
-            ]
+            )
 
         optim_adamw = AdamW(
             adamw_param_groups,
             betas=adam_betas,
-            weight_decay=0.0
+            weight_decay=0.0,
+            fused=True
         )
 
-        # TODO: Sort matrix parameters in terms of sizes
         MuonFactory = DistributedMuon if is_dist_requested() else Muon
         optim_muon = MuonFactory(
             matrix_params + gate_params,

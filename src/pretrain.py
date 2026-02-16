@@ -20,22 +20,29 @@ master_process = rank == 0
 
 # HYPERPARAMETERS
 CONTEXT_LENGTH = FiberGPTConfig.context_length
-BATCH_SIZE = 524_288  # ~0.5M in tokens
+BATCH_SIZE = 1_048_576  # ~1M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
-NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM
+NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM (enough for H100)
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
-# Training hyperparams
-MAX_ITER = 20_000  # Roughly enough to go through the entire dataset
-WARMUP_ITER_RATIO = 0.01
-WARMDOWN_ITER_RATIO = 0.5
+# TRAINING HYPERPARAMS
+MAX_ITER = 10_000  # Roughly enough to go through the entire dataset
+
+# Warmup on 500M tokens -> Stabilize
+# Constnat on 4B tokens -> Learn main patterns
+# Warmdown on 5.5B tokens -> Fine-tune and converge
+WARMUP_ITER_RATIO = 0.05
+COOLDOWN_ITER_RATIO = 0.55
 FINAL_LR_RATIO = 0.1
-WEIGHT_DECAY_ITER_RATIO = 0.01
+MUON_MOMENTUM_MAX = 0.95
+MUON_MOMENTUM_MIN = 0.85
+MUON_MOMENTUM_WARMUP_ITER_RATIO = 0.05
+MUON_MOMENTUM_COOLDOWN_ITER_RATIO = 0.01
 
 # Sample, eval and checkpoint
 SAMPLE_EVERY = 500
 EVAL_EVERY = 500
-EVAL_STEPS = 25
+EVAL_STEPS = 5
 CHECKPOINT_EVERY = 500
 
 
@@ -67,7 +74,9 @@ if distributed:
 
 
 # Optimizers
-optims = orig_model.setup_optimizers()  # Use the default optimizer parameters
+optims = orig_model.setup_optimizers(
+    muon_momentum=MUON_MOMENTUM_MIN
+)  # Mostly use the default optimizer parameters
 
 def optim_step():
     for optim in optims:
@@ -77,14 +86,13 @@ def optim_zero_grad():
     for optim in optims:
         optim.zero_grad(set_to_none=True)
 
-def optim_update_params(lrm: float, momentum: float, weight_decay: float):
+def optim_update_params(lrm: float, momentum: float):
     for optim in optims:
         for group in optim.param_groups:
             group['lr'] = group['initial_lr'] * lrm
 
             if isinstance(optim, (Muon, DistributedMuon)):
                 group['momentum'] = momentum
-                group['weight_decay'] = weight_decay
 
 
 # Initialize dataloaders for train and val
@@ -101,32 +109,39 @@ eval_loader = DDGPretrain(
 # Learning rate scheduling (linear warmup, constant, cosine decay)
 def get_lr_multiplier(step: int):
     warmup_iter = round(WARMUP_ITER_RATIO * MAX_ITER)
-    warmdown_iter = round(WARMDOWN_ITER_RATIO * MAX_ITER)
+    cooldown_iter = round(COOLDOWN_ITER_RATIO * MAX_ITER)
 
     # Linear warmup
     if step < warmup_iter:
         return (step + 1) / warmup_iter
     # Constant
-    elif step <= MAX_ITER - warmdown_iter:
+    elif step <= MAX_ITER - cooldown_iter:
         return 1.0
 
     # Cosine decay
-    decay_ratio = (step - (MAX_ITER - warmdown_iter)) / warmdown_iter
+    decay_ratio = (step - (MAX_ITER - cooldown_iter)) / cooldown_iter
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return FINAL_LR_RATIO + coeff * (1.0 - FINAL_LR_RATIO)
 
 
 # Warmup Muon optimizer momentum to 0.95
 def get_muon_momentum(step: int):
-    weight_decay_iters = WEIGHT_DECAY_ITER_RATIO * MAX_ITER
-    frac = min(step / weight_decay_iters, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
+    warmup_steps = MAX_ITER * MUON_MOMENTUM_WARMUP_ITER_RATIO
+    cooldown_steps = MAX_ITER * MUON_MOMENTUM_COOLDOWN_ITER_RATIO
+    cooldown_start = MAX_ITER - cooldown_steps
+
+    if step < warmup_steps:
+        frac = step / warmup_steps
+        momentum = MUON_MOMENTUM_MIN + frac * (MUON_MOMENTUM_MAX -
+            MUON_MOMENTUM_MIN)
+    elif step > cooldown_start:
+        frac = (step - cooldown_start) / cooldown_steps
+        momentum = MUON_MOMENTUM_MAX - frac * (MUON_MOMENTUM_MAX -
+            MUON_MOMENTUM_MIN)
+    else:
+        momentum = MUON_MOMENTUM_MAX
+
     return momentum
-
-
-# Weight decay scheduler for Muon. Start with 0.1 and reduce to 0.0.
-def get_weight_decay(it: int):
-    return 0.1 * (1 - it / MAX_ITER)
 
 
 # Sample prompts
@@ -214,8 +229,7 @@ for step in range(MAX_ITER + 1):
 
     optim_update_params(
         get_lr_multiplier(step),
-        get_muon_momentum(step),
-        get_weight_decay(step)
+        get_muon_momentum(step)
     )
 
     optim_step()
@@ -225,7 +239,7 @@ for step in range(MAX_ITER + 1):
     dt = t1 - t0
     tps = BATCH_SIZE // dt
 
-    print0(f'{step=}, {train_loss=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps}')
+    print0(f'{step=}, {train_loss=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps:d}')
 
     # Save the model in final step
     if master_process and last_step:

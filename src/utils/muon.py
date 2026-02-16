@@ -79,6 +79,10 @@ class Muon(Optimizer):
         nesterov: bool = True,
         ortho_steps: int = 5
     ):
+        assert isinstance(params, list) and all(
+            isinstance(p, torch.nn.Parameter) for p in params
+        )
+
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -137,6 +141,10 @@ class DistributedMuon(Optimizer):
         nesterov: bool = True,
         ortho_steps: int = 5
     ):
+        assert isinstance(params, list) and all(
+            isinstance(p, torch.nn.Parameter) for p in params
+        )
+
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -145,6 +153,10 @@ class DistributedMuon(Optimizer):
             ortho_steps=ortho_steps
         )
 
+        # To reduce barrier synchronization, increasing efficiency
+        params = sorted(params, key=lambda x: x.numel(), reverse=True)
+
+        # Init optimizer
         super().__init__(params, defaults)
 
         # Store distributed info
