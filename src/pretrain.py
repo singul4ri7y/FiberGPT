@@ -20,13 +20,13 @@ master_process = rank == 0
 
 # HYPERPARAMETERS
 CONTEXT_LENGTH = FiberGPTConfig.context_length
-BATCH_SIZE = 1_048_576  # ~1M in tokens
+BATCH_SIZE = 2_097_152  # Effective batch size: ~2M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
 NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM (enough for H100)
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
 # TRAINING HYPERPARAMS
-MAX_ITER = 10_000  # Roughly enough to go through the entire dataset
+MAX_ITER = 5_000  # Roughly enough to go through the entire dataset
 
 # Warmup on 500M tokens -> Stabilize
 # Constnat on 4B tokens -> Learn main patterns
@@ -39,11 +39,12 @@ MUON_MOMENTUM_MIN = 0.85
 MUON_MOMENTUM_WARMUP_ITER_RATIO = 0.05
 MUON_MOMENTUM_COOLDOWN_ITER_RATIO = 0.01
 
-# Sample, eval and checkpoint
+# Sample, eval and checkpoint and GC
 SAMPLE_EVERY = 500
 EVAL_EVERY = 500
-EVAL_STEPS = 5
+EVAL_STEPS = 2
 CHECKPOINT_EVERY = 500
+GC_COLLECT_EVERY = 2000
 
 
 # Warn if FA3 is not available.
@@ -124,7 +125,7 @@ def get_lr_multiplier(step: int):
     return FINAL_LR_RATIO + coeff * (1.0 - FINAL_LR_RATIO)
 
 
-# Warmup Muon optimizer momentum to 0.95
+# Warmup Muon optimizer momentum to maximum
 def get_muon_momentum(step: int):
     warmup_steps = MAX_ITER * MUON_MOMENTUM_WARMUP_ITER_RATIO
     cooldown_steps = MAX_ITER * MUON_MOMENTUM_COOLDOWN_ITER_RATIO
@@ -181,12 +182,23 @@ for step in range(MAX_ITER + 1):
         if distributed:
             dist.all_reduce(eval_loss, op=dist.ReduceOp.AVG)
 
+        perplexity = math.exp(eval_loss)
+        if perplexity > 15:
+            verdict = 'Suboptimal'
+        elif perplexity <= 12:
+            verdict = 'Excellent!!'
+        else: verdict = 'Great!'
+
+
         # Record and report validation loss
         eval_loss_record = torch.cat(
             (eval_loss_record, eval_loss.cpu().view(1)),
             dim=0
         )
-        print0(f'{step=} evaluation loss: {eval_loss.item():.4f}')
+        print0(
+            f'{step=} -> evaluation loss: {eval_loss.item():.4f}, '
+            f'{perplexity=:.4f}, perplexity verdict: {verdict}'
+        )
 
         model.train()
 
@@ -250,8 +262,7 @@ for step in range(MAX_ITER + 1):
         gc.freeze()
         # Nuke the GC to reduce overhead
         gc.disable()
-    elif step % 2500 == 0:
-        # Collect every 2500 steps
+    elif step % GC_COLLECT_EVERY == 0:
         gc.collect()
 
 

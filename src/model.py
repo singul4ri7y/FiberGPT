@@ -268,8 +268,6 @@ class FiberGPT(nn.Module):
         base: int = 10000,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
-        ## TODO: Keep RoPE cache in bfloat16
-
         ''' Precompute rotation cache of Rotary Positional Embedding. '''
 
         if device is None:
@@ -450,7 +448,8 @@ class FiberGPT(nn.Module):
             return F.cross_entropy(
                 logits.view(B * T, -1),
                 targets.view(B * T).long(),
-                reduction=loss_reduction
+                reduction=loss_reduction,
+                ignore_index=-69
             )
         else:
             return logits

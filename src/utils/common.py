@@ -54,7 +54,7 @@ def compute_init(device_type='cuda'):
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     distributed, rank, local_rank, world_size = get_dist_info()
     if distributed and device_type == 'cuda':
-        device = torch.device("cuda", local_rank)
+        device = torch.device('cuda', local_rank)
         torch.cuda.set_device(device)  # Make CUDA:<rank> default device
         dist.init_process_group(backend='nccl', device_id=device)
 

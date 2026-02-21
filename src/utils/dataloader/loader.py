@@ -62,12 +62,19 @@ def DDGPretrain(
 
         buff = tokens[pos + rank * device_batch_size:][:device_batch_size+1]
         inputs = buff[:-1].to(
-            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
+            device=f'cuda:{rank}', dtype=torch.uint16, non_blocking=True
         ).view(device_batch_length, context_length)
         targets = buff[1:].to(
-            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
+            device=f'cuda:{rank}', dtype=torch.uint16, non_blocking=True
         ).view(device_batch_length, context_length)
 
         pos += batch_size
         yield inputs, targets
+
+
+# Distributed Data Generator for chat SFT
+def DDGFinetune(
+
+):
+    pass
 
