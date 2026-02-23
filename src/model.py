@@ -363,9 +363,9 @@ class FiberGPT(nn.Module):
 
     def setup_optimizers(
         self,
-        embedding_lr: float = 8e-3, proj_lr: float = 4e-3,
+        embedding_lr: float = 3e-2, proj_lr: float = 8e-3,
         matrix_lr: float = 0.02,
-        adam_betas=(0.85, 0.95),
+        adam_betas=(0.9, 0.95),
         muon_weight_decay: float = 0.01,
         muon_momentum: float = 0.95
     ):
@@ -380,14 +380,21 @@ class FiberGPT(nn.Module):
 
         # If weights are tied
         if self.token_embedding.weight is self.proj.weight:
-            adamw_param_groups.append(
+            adamw_param_groups = [
+                dict(params=embedding_params, lr=proj_lr),  # Slightly low lr
+                dict(params=value_params, lr=embedding_lr)
+            ]
+        else:
+            adamw_param_groups = [
+                dict(params=embedding_params + value_params, lr=embedding_lr),
                 dict(params=self.proj.parameters(), lr=proj_lr)
-            )
+            ]
 
         optim_adamw = AdamW(
             adamw_param_groups,
             betas=adam_betas,
             weight_decay=0.0,
+            eps=1e-9,
             fused=True
         )
 

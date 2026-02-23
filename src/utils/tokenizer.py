@@ -24,7 +24,7 @@ _extended_special_tokens = {
     '<|python_start|>': 50261,
     '<|python_end|>': 50262,
 
-    # Not sure what it does (yet)
+    # Should hold the result of the expression with <|python_*|> wrapper.
     '<|output_start|>': 50263,
     '<|output_end|>': 50264
 }
@@ -87,7 +87,7 @@ def tokenize_conversation(conversation: list):
         # Sanity check
         role = message['role']
         must_be_from = 'user' if i % 2 == 0 else 'assistant'
-        assert role is not must_be_from, (f'Message {i} must be form '
+        assert role == must_be_from, (f'Message {i} must be form '
             f'{must_be_from}, found {role}!')
 
         # Content can either be plain string or a list of parts containing
@@ -122,8 +122,8 @@ def tokenize_conversation(conversation: list):
                         add_tokens(value_tokens, 1)
                         add_tokens(python_end, 1)
 
-                    # Not sure what is does (yet)
-                    elif part['type'] == 'python_output':
+                    # Mathematical expression result, python output
+                    elif part['type'] == 'output':
                             add_tokens(output_start, 0)
                             add_tokens(value_tokens, 0)
                             add_tokens(output_end, 0)

@@ -3,6 +3,7 @@
 import torch
 import random
 from pathlib import Path
+from .dataset import DatasetCollator
 
 
 def _load_data_shard(file: Path):
@@ -26,7 +27,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, ('Number of tokens read does not match'
             ' metadata')
 
-    return tokens
+    return tokens.to(torch.int32)
 
 
 # Randomize data shards for later epochs
@@ -62,10 +63,10 @@ def DDGPretrain(
 
         buff = tokens[pos + rank * device_batch_size:][:device_batch_size+1]
         inputs = buff[:-1].to(
-            device=f'cuda:{rank}', dtype=torch.uint16, non_blocking=True
+            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
         ).view(device_batch_length, context_length)
         targets = buff[1:].to(
-            device=f'cuda:{rank}', dtype=torch.uint16, non_blocking=True
+            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
         ).view(device_batch_length, context_length)
 
         pos += batch_size
@@ -74,7 +75,43 @@ def DDGPretrain(
 
 # Distributed Data Generator for chat SFT
 def DDGFinetune(
-
+    collator: DatasetCollator,
+    device_batch_length: int, context_length: int,
+    rank: int, world_size: int
 ):
-    pass
+    assert device_batch_length % world_size == 0, ('Batch size should be '
+        'multiple of world_size')
+
+    device_batch_size = device_batch_length * context_length
+    batch_size = device_batch_size * world_size  # Total batch size in tokens
+    tokens, masks = collator.get_only_shard()
+    tokens_size = len(tokens)
+    pos = 0
+
+    while True:
+        # Finetune dataset is a single data shard of roughly ~550M
+        if pos + batch_size + 1 >= tokens_size:
+            tokens, masks = collator.get_only_shard()
+            tokens_size = len(tokens)
+            pos = 0
+
+        buff = tokens[pos + rank * device_batch_size:][:device_batch_size+1]
+        # Buffer for masking
+        mbuff = masks[pos + rank * device_batch_size + 1:][:device_batch_size]
+        inputs = buff[:-1].to(
+            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
+        ).view(device_batch_length, context_length)
+        targets = buff[1:].to(
+            device=f'cuda:{rank}', dtype=torch.int32, non_blocking=True
+        ).view(device_batch_length, context_length)
+
+        # Mask targets
+        targets[
+            ~mbuff.to(
+                device=f'cuda:{rank}', dtype=torch.bool, non_blocking=True
+            ).view(device_batch_length, context_length)
+        ] = -69
+
+        pos += batch_size
+        yield inputs, targets
 

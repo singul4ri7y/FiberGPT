@@ -7,9 +7,9 @@ from torch.nn.parallel import DistributedDataParallel
 from model import FiberGPT, FiberGPTConfig
 from utils.common import compute_init, compute_cleanup, print0, save_model
 from utils.attention import fa3_available
-from utils.dataloader import DDGPretrain
+from utils.dataloader import *
 from utils.muon import Muon, DistributedMuon
-from utils.tokenizer import tokenizer
+from utils.tokenizer import tokenizer, _extended_special_tokens
 
 
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -26,11 +26,14 @@ NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM (enough for H100)
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
 # TRAINING HYPERPARAMS
-MAX_ITER = 5_000  # Roughly enough to go through the entire dataset
+MAX_ITER = 600  # Roughly ~2 epochs
+CUSTOM_JSON_EPOCHS = 2
+MMLU_EPOCHS = 3
+GSM8K_EPOCHS = 4
 
-# Warmup on 500M tokens -> Stabilize
-# Constant on 4B tokens -> Learn main patterns
-# Warmdown on 5.5B tokens -> Fine-tune and converge
+# Warmup on 60M tokens -> Stabilize
+# Constant on 480M tokens -> Learn fine-tune patterns
+# Warmdown on 660M tokens -> Finer fine-tune and convergence
 WARMUP_ITER_RATIO = 0.05
 COOLDOWN_ITER_RATIO = 0.55
 FINAL_LR_RATIO = 0.1
@@ -40,11 +43,11 @@ MUON_MOMENTUM_WARMUP_ITER_RATIO = 0.05
 MUON_MOMENTUM_COOLDOWN_ITER_RATIO = 0.01
 
 # Sample, eval and checkpoint and GC
-SAMPLE_EVERY = 250
-EVAL_EVERY = 250
-EVAL_STEPS = 5
-CHECKPOINT_EVERY = 250
-GC_COLLECT_EVERY = 1000
+SAMPLE_EVERY = 100
+EVAL_EVERY = 100
+EVAL_STEPS = 2
+CHECKPOINT_EVERY = 100
+GC_COLLECT_EVERY = 200
 
 
 # Warn if FA3 is not available.
@@ -60,8 +63,12 @@ autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 
 # Compile the model
-orig_model = FiberGPT(FiberGPTConfig()).to(device)
-compiled_model = torch.compile(orig_model, dynamic=False, fullgraph=True)
+orig_model = FiberGPT(FiberGPTConfig())
+# Load pretrained parameters
+pretrained_params = torch.load('fibergpt_pretrain.bin')
+orig_model.load_state_dict(pretrained_params['model'])
+
+compiled_model = torch.compile(orig_model.to(device), dynamic=False, fullgraph=True)
 model = compiled_model
 
 # Wrap model in DDP
@@ -76,8 +83,11 @@ if distributed:
 
 # Optimizers
 optims = orig_model.setup_optimizers(
+    # Using x0.5 of pretrain lr
+    embedding_lr=0.015, proj_lr=4e-3,
+    matrix_lr=0.01,
     muon_momentum=MUON_MOMENTUM_MIN
-)  # Mostly use the default optimizer parameters
+)
 
 def optim_step():
     for optim in optims:
@@ -96,14 +106,28 @@ def optim_update_params(lrm: float, momentum: float):
                 group['momentum'] = momentum
 
 
+# Initialize dataset
+train_ds = DatasetCollatorRandom([
+    SmolTalk(split='train'),
+    *([ CustomJSON() ] * CUSTOM_JSON_EPOCHS),
+    *([ MMLU(subset='auxiliary_train', split='train') ] * MMLU_EPOCHS),
+    *([ GSM8K(subset='main', split='train') ] * GSM8K_EPOCHS),
+    SimpleSpelling(size=200_000, split='train'),
+    SpellingBee(size=80_000, split='train')
+])  # Roughly 557M tokens
+eval_ds = DatasetCollatorRandom([
+    SmolTalk(split='train'),
+    MMLU(subset='all', split='test'),
+    GSM8K(subset='main')
+])  # Roughly 24M tokens
 # Initialize dataloaders for train and val
-train_loader = DDGPretrain(
-    'data/fineweb10b/fineweb_train_*.bin',
-    NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH, rank, world_size
+train_loader = DDGFinetune(
+    train_ds, NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH,
+    rank, world_size
 )
-eval_loader = DDGPretrain(
-    'data/fineweb10b/fineweb_val_*.bin',
-    NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH, rank, world_size
+eval_loader = DDGFinetune(
+    eval_ds, NO_OF_BATCH_PER_DEVICE, CONTEXT_LENGTH,
+    rank, world_size
 )
 
 
@@ -147,14 +171,25 @@ def get_muon_momentum(step: int):
 
 # Sample prompts
 sample_prompts = [
-    'The capital of France is',
-    'The chemical symbol of gold is',
-    'If yesterday was Friday, then tomorrow will be',
-    'The opposite of hot is',
-    'The planets of the solar system are:',
-    'My favorite color is',
-    'If 5*x + 3 = 13, then x is',
+    'Hello!',
+    'Who are you?',
+    'Spell the word fantastic',
+    'If Mary has 12 apples and Max have 3 times more apples than Mary, then '
+    'who has more apples?',
+    'If 5 * x + 3 = 13, then what would be x?',
+    'How many s is in colossal?',
+    'What is the capital of Bangladesh?',
+    'Why the sky is blue?',
+    'Tell me more about yourself.',
+    'Who created you?',
+    'Tell me more about Muon optimizer.'
 ]
+# Special tokens for sampling
+eot = bos = _extended_special_tokens['<|endoftext|>']
+user_start = _extended_special_tokens['<|user_start|>']
+user_end = _extended_special_tokens['<|user_end|>']
+assistant_start = _extended_special_tokens['<|assistant_start|>']
+assistant_end = _extended_special_tokens['<|assistant_end|>']
 
 
 # Tensor to store validation loss
@@ -166,7 +201,7 @@ for step in range(MAX_ITER + 1):
     last_step = step == MAX_ITER
 
     # Evaluate validation loss
-    if step > 0 and step % EVAL_EVERY == 0:
+    if last_step or (step > 0 and step % EVAL_EVERY == 0):
         # All processes should perform the evaluation.
         model.eval()
 
@@ -182,23 +217,12 @@ for step in range(MAX_ITER + 1):
         if distributed:
             dist.all_reduce(eval_loss, op=dist.ReduceOp.AVG)
 
-        perplexity = math.exp(eval_loss)
-        if perplexity > 15:
-            verdict = 'Suboptimal'
-        elif perplexity <= 12:
-            verdict = 'Excellent!!'
-        else: verdict = 'Great!'
-
-
         # Record and report validation loss
         eval_loss_record = torch.cat(
             (eval_loss_record, eval_loss.cpu().view(1)),
             dim=0
         )
-        print0(
-            f'{step=} -> evaluation loss: {eval_loss.item():.4f}, '
-            f'{perplexity=:.4f}, perplexity verdict: {verdict}'
-        )
+        print0(f'{step=} -> evaluation loss: {eval_loss.item():.4f}')
 
         model.train()
 
@@ -208,10 +232,11 @@ for step in range(MAX_ITER + 1):
 
         with torch.no_grad(), autocast_ctx:
             for i, prompt in enumerate(sample_prompts):
-                print0(f'Sample {i + 1}: {prompt}', end='')
+                print0(f'User {i + 1}: {prompt}\nFiberGPT: ', end='')
 
-                tokens = tokenizer.encode(prompt)
-                y = orig_model.generate(tokens, 32)
+                tokens = ([bos, user_start ] +
+                    tokenizer.encode(prompt) + [ user_end, assistant_start ])
+                y = orig_model.generate(tokens, 64)
 
                 for token in y:
                     print0(tokenizer.decode([token]), end='')
@@ -229,7 +254,7 @@ for step in range(MAX_ITER + 1):
         if master_process:
             save_model(
                 orig_model, optims, eval_loss_record,
-                'fibergpt_pretrain.bin'
+                'fibergpt_sft.bin'
             )
 
         # No need to update in last step
