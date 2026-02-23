@@ -1,4 +1,4 @@
-# Everythin about SFT datasets
+# Everything about SFT datasets
 
 import os
 import torch

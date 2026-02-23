@@ -20,13 +20,13 @@ master_process = rank == 0
 
 # HYPERPARAMETERS
 CONTEXT_LENGTH = FiberGPTConfig.context_length
-BATCH_SIZE = 2_097_152  # Effective batch size: ~2M in tokens
+BATCH_SIZE = 1_048_576  # Effective batch size: ~1M in tokens
 NO_OF_BATCH = BATCH_SIZE // (world_size * CONTEXT_LENGTH)
 NO_OF_BATCH_PER_DEVICE = 64  # Change this based on GPU VRAM (enough for H100)
 GRAD_ACCUM_STEPS = NO_OF_BATCH // NO_OF_BATCH_PER_DEVICE
 
 # TRAINING HYPERPARAMS
-MAX_ITER = 5_000  # Roughly enough to go through the entire dataset
+MAX_ITER = 10_000  # Roughly enough to go through the entire dataset
 
 # Warmup on 500M tokens -> Stabilize
 # Constant on 4B tokens -> Learn main patterns
@@ -40,11 +40,11 @@ MUON_MOMENTUM_WARMUP_ITER_RATIO = 0.05
 MUON_MOMENTUM_COOLDOWN_ITER_RATIO = 0.01
 
 # Sample, eval and checkpoint and GC
-SAMPLE_EVERY = 250
-EVAL_EVERY = 250
-EVAL_STEPS = 5
-CHECKPOINT_EVERY = 250
-GC_COLLECT_EVERY = 1000
+SAMPLE_EVERY = 500
+EVAL_EVERY = 500
+EVAL_STEPS = 10
+CHECKPOINT_EVERY = 500
+GC_COLLECT_EVERY = 2500
 
 
 # Warn if FA3 is not available.
@@ -261,9 +261,9 @@ for step in range(MAX_ITER + 1):
 
     t1 = time.perf_counter()
     dt = t1 - t0
-    tps = BATCH_SIZE // dt
+    tps = int(BATCH_SIZE // dt)
 
-    print0(f'{step=}, {train_loss=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps:d}')
+    print0(f'{step=}, {train_loss=:.4f}, took={dt * 1000:.4f}ms, tok/sec={tps}')
 
     if step == 0:
         gc.collect()

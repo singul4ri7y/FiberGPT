@@ -23,11 +23,8 @@ def _load_fa3():
         if major != 9:
             return None
 
-        import os
-        from kernels import get_kernel
-
-        os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        import flash_attn_interface
+        return flash_attn_interface
     except:
         pass
 

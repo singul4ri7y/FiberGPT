@@ -27,7 +27,7 @@ class FiberGPTConfig:
     # Sliding window attention pattern string
     # S = Small, M = Medium (half context), L = Large (full context)
     # Patterns are repeated throughout the layers.
-    window_pattern: str = 'LMML'
+    window_pattern: str = 'MMLL'
 
 
 def rms_norm(x: torch.Tensor, eps: float):
@@ -160,7 +160,7 @@ class FeedForward(nn.Module):
         self.proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor):
-        return self.proj(F.silu(self.hl(x)))
+        return self.proj(F.relu(self.hl(x)).square())
 
 
 class TransformerBlock(nn.Module):
@@ -210,8 +210,6 @@ class FiberGPT(nn.Module):
         # embeddings and gate network.
         if config.use_value_residuals:
             self.value_embedding = nn.Embedding(config.n_vocab, config.n_embd)
-
-            # Gate projection with bias seems to perform better
             self.v_gate = nn.Linear(config.n_embd, config.n_embd, bias=False)
         else:
             self.value_embedding = None
@@ -365,7 +363,7 @@ class FiberGPT(nn.Module):
         self,
         embedding_lr: float = 3e-2, proj_lr: float = 8e-3,
         matrix_lr: float = 0.02,
-        adam_betas=(0.9, 0.95),
+        adam_betas=(0.8, 0.95),
         muon_weight_decay: float = 0.01,
         muon_momentum: float = 0.95
     ):
